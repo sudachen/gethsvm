@@ -6,42 +6,71 @@ extern crate libc;
 extern crate block_core;
 extern crate block;
 
+#[macro_use]
+extern crate arrayref;
+
 use std::mem::{drop,forget};
 use std::ffi::{CStr,CString};
 use std::rc::Rc;
 use std::ptr;
+use std::slice;
 use std::str::FromStr;
+use std::collections::{HashSet,HashMap,hash_map};
 
 use libc::{c_char,size_t};
 use bigint::{Gas, H160, U256, H256, M256, Address};
 use hexutil::*;
 use block::TransactionAction;
 use sputnikvm::errors::RequireError;
-use sputnikvm::{VM, SeqTransactionVM, HeaderParams, MainnetEIP160Patch, ValidTransaction, SeqContextVM, AccountCommitment, Context, AccountChange, Storage, Patch, VMStatus};
+use sputnikvm::{Log,VM, SeqTransactionVM, HeaderParams, MainnetFrontierPatch, MainnetHomesteadPatch, MainnetEIP160Patch, ValidTransaction, SeqContextVM, AccountCommitment, Context, AccountChange, Storage, Patch, VMStatus};
 
 #[no_mangle]
 pub extern fn sputnikvm_is_implemented() -> i32 {
   1
 }
 
-fn address_from_ptr( ptr: *const c_char ) -> Address {
-    Address::from_str(unsafe{CStr::from_ptr(ptr)}.to_str().unwrap()).unwrap()
+fn address_from_bits( ptr: *const u8 ) -> Address {
+    let bits = unsafe { slice::from_raw_parts( ptr, 20) };
+    Address::from(bits)
 }
 
-fn gas_from_ptr( ptr: *const c_char ) -> Gas {
-    Gas::from_str(unsafe{CStr::from_ptr(ptr)}.to_str().unwrap()).unwrap()
+use std::io::Write;
+
+fn u256_from_bits( ptr: *const u8 ) -> U256 {
+    let bytes = unsafe { slice::from_raw_parts( ptr, 32) };
+    let mut ret = [0u64; 4];
+    for i in 0..bytes.len() {
+        let pos = i / 8;
+        ret[pos] += (bytes[i] as u64) << ((i % 8) * 8);
+    }
+    writeln!(std::io::stderr(),"U256={:x},{}",U256(ret),U256(ret));
+    U256(ret)
 }
 
-fn u256_from_ptr( ptr: *const c_char ) -> U256 {
-    U256::from_str(unsafe{CStr::from_ptr(ptr)}.to_str().unwrap()).unwrap()
+fn gas_from_bits( ptr: *const u8 ) -> Gas {
+    u256_from_bits(ptr).into()
 }
 
-fn h256_from_ptr( ptr: *const c_char ) -> H256 {
-    H256::from_str(unsafe{CStr::from_ptr(ptr)}.to_str().unwrap()).unwrap()
+fn h256_from_bits( ptr: *const u8 ) -> H256 {
+    let mut ret = [0u8; 32];
+    unsafe{ ptr::copy(ptr,&mut ret[0],32) }
+    writeln!(std::io::stderr(),"H256={:x},{}",H256(ret),H256(ret));
+    H256(ret)
 }
 
-fn m256_from_ptr( ptr: *const c_char ) -> M256 {
-    M256::from_str(unsafe{CStr::from_ptr(ptr)}.to_str().unwrap()).unwrap()
+fn m256_from_bits( ptr: *const u8 ) -> M256 {
+    u256_from_bits(ptr).into()
+}
+
+fn vec_from_bits( ptr: *const u8, len: usize ) -> Vec<u8> {
+    let mut v : Vec<u8> = Vec::with_capacity(len);
+    if len > 0 {
+        unsafe {
+            v.set_len(len);
+            ptr::copy(ptr,&mut v[0],len);
+        }
+    }
+    v
 }
 
 struct Accounts {
@@ -51,69 +80,102 @@ struct Accounts {
 
 impl Accounts {
     fn next(&mut self) -> Option<*const AccountChange> {
-        if self.index < self.list.len() { self.index+=1; Some(self.list[self.index])} else {None}
+        if self.index < self.list.len() {
+            let i = self.index;
+            self.index+=1;
+            Some(self.list[i])
+        } else {None}
+    }
+}
+
+struct KV {
+    list : Vec<(H256,H256)>,
+    index: usize
+}
+
+impl KV {
+    fn next(&mut self) -> Option<&(H256,H256)> {
+        if self.index < self.list.len() {
+            let i = self.index;
+            self.index+=1;
+            Some(&self.list[i])
+        } else {None}
     }
 }
 
 pub struct EvmContext {
     vm : Box<VM>,
-    req_blocknum : u64,
-    req_address : CString,
-    req_hash : CString,
+    blocknum : u64,
+    address : Address,
+    hash : H256,
     out : CString,
-    out_len : usize,
-    account : Accounts
+    account : Accounts,
+    kv: KV,
 }
+
+const SPUTNIK_VM_FORK_FRONTIER : i32 = 0;
+const SPUTNIK_VM_FORK_HOMESTEAD : i32 = 1;
+const SPUTNIK_VM_FORK_GASREPRICE : i32 = 2;
+const SPUTNIK_VM_FORK_DIEHARD : i32 = 3;
+
+const G_TXDATAZERO: u64 = 4;
+const G_TXDATANONZERO: u64 = 68;
+const G_TRANSACTION: u64 = 21000;
 
 #[no_mangle]
 pub extern fn sputnikvm_context(
     create_new: i32,
-    gas: *const c_char,
-    price: *const c_char,
-    value: *const c_char,
-    caller: *const c_char,
-    target: *const c_char,
-    bytes: *mut u8,
+    gas: *const u8,
+    price: *const u8,
+    value: *const u8,
+    caller: *const u8,
+    target: *const u8,
+    bytes: *const u8,
     bytes_len: usize,
-    gas_limit: *const c_char,
-    coinbase: *const c_char,
+    gas_limit: *const u8,
+    coinbase: *const u8,
     fork: i32,
-    blocknum: *const c_char,
+    blocknum: u64,
     time: u64,
-    difficulty: *const c_char) -> *mut EvmContext {
+    difficulty: *const u8) -> *mut EvmContext {
 
-    let input = unsafe { Vec::from_raw_parts(bytes, bytes_len, bytes_len) };
-
-    fn new_vm( t: ValidTransaction, p: HeaderParams ) -> Box<VM> {
-        Box::new(SeqTransactionVM::<MainnetEIP160Patch>::new(t,p))
+    fn new_vm( t: ValidTransaction, p: HeaderParams, fork: i32 ) -> Box<VM> {
+        match fork {
+            SPUTNIK_VM_FORK_FRONTIER => Box::new(SeqTransactionVM::<MainnetFrontierPatch>::new(t, p)),
+            SPUTNIK_VM_FORK_HOMESTEAD => Box::new(SeqTransactionVM::<MainnetHomesteadPatch>::new(t, p)),
+            SPUTNIK_VM_FORK_DIEHARD => Box::new(SeqTransactionVM::<MainnetEIP160Patch>::new(t, p)),
+            _ => Box::new(SeqTransactionVM::<MainnetEIP160Patch>::new(t, p)),
+        }
     };
 
     let vm_impl = new_vm(
         ValidTransaction {
-            caller: Some(address_from_ptr(caller)),
-            gas_price: gas_from_ptr(price),
-            gas_limit: gas_from_ptr(gas),
-            action: if create_new != 0 { TransactionAction::Create } else { TransactionAction::Call(address_from_ptr(target)) },
-            value: u256_from_ptr(value),
-            input: Rc::new(input),
+            caller: Some(address_from_bits(caller)),
+            gas_price: gas_from_bits(price),
+            gas_limit: gas_from_bits(gas),
+            action: if create_new != 0 { TransactionAction::Create } else { TransactionAction::Call(address_from_bits(target)) },
+            value: u256_from_bits(value),
+            input: Rc::new(vec_from_bits(bytes, bytes_len)),
             nonce: U256::zero(),
         },
         HeaderParams {
-            beneficiary: address_from_ptr(coinbase),
+            beneficiary: address_from_bits(coinbase),
             timestamp: time,
-            number: u256_from_ptr(blocknum),
-            difficulty: u256_from_ptr(difficulty),
-            gas_limit: gas_from_ptr(gas_limit),
-        });
+            number: blocknum.into(),
+            difficulty: u256_from_bits(difficulty),
+            gas_limit: gas_from_bits(gas_limit),
+        },
+        fork,
+    );
 
     let mut ctx = Box::new(EvmContext {
         vm : vm_impl,
-        req_blocknum : 0,
-        req_address : CString::new("").unwrap(),
-        req_hash : CString::new("").unwrap(),
+        blocknum : 0,
+        address : Address::new(),
+        hash : 0.into(),
         out : CString::new("").unwrap(),
-        out_len : 0,
         account: Accounts{list: Vec::new(), index: 0},
+        kv: KV{list: Vec::new(), index: 0},
     });
 
     let ptr: *mut _ = &mut *ctx;
@@ -141,20 +203,20 @@ pub extern fn sputnikvm_fire(ptr: *mut EvmContext) -> i32 {
     let ctx = unsafe{&mut *ptr};
     match ctx.vm.fire() {
         Err(RequireError::Account(address)) => {
-            ctx.req_address = CString::new(format!("0x{:x}",address)).unwrap();
+            ctx.address = address;
             SPUTNIK_VM_REQUIRE_ACCOUNT
         },
         Err(RequireError::AccountCode(address)) => {
-            ctx.req_address = CString::new(format!("0x{:x}",address)).unwrap();
+            ctx.address = address;
             SPUTNIK_VM_REQUIRE_CODE
         },
         Err(RequireError::AccountStorage(address, index)) => {
-            ctx.req_address = CString::new(format!("0x{:x}",address)).unwrap();
-            ctx.req_hash = CString::new(format!("0x{:x}",index)).unwrap();
+            ctx.address = address;
+            ctx.hash = index.into();
             SPUTNIK_VM_REQUIRE_VALUE
         },
         Err(RequireError::Blockhash(number)) => {
-            ctx.req_blocknum = number.as_u64();
+            ctx.blocknum = number.as_u64();
             SPUTNIK_VM_REQUIRE_HASH
         },
         Ok(()) => SPUTNIK_VM_EXITED_OK,
@@ -162,21 +224,23 @@ pub extern fn sputnikvm_fire(ptr: *mut EvmContext) -> i32 {
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_req_address(ptr: *mut EvmContext) -> *const c_char {
+pub extern fn sputnikvm_req_address_copy(ptr: *mut EvmContext, out: *mut u8) -> size_t {
     let ctx = unsafe{&*ptr};
-    ctx.req_address.as_ptr()
+    unsafe { ptr::copy(&ctx.address[0], out, 20) };
+    20
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_req_hash(ptr: *mut EvmContext) -> *const c_char {
+pub extern fn sputnikvm_req_hash_copy(ptr: *mut EvmContext, out: *mut u8) -> size_t {
     let ctx = unsafe{&*ptr};
-    ctx.req_hash.as_ptr()
+    unsafe { ptr::copy(&ctx.hash[0], out, 32) };
+    32
 }
 
 #[no_mangle]
 pub extern fn sputnikvm_req_blocknum(ptr: *mut EvmContext) -> u64 {
     let ctx = unsafe{&*ptr};
-    ctx.req_blocknum
+    ctx.blocknum
 }
 
 static EMPTY: [u8; 0] = [];
@@ -184,31 +248,30 @@ static EMPTY: [u8; 0] = [];
 #[no_mangle]
 pub extern fn sputnikvm_commit_account(
     ptr: *mut EvmContext,
-    addr_ptr: *const c_char,
+    addr: *const u8,
     nonce: u64,
-    balance_ptr: *const c_char,
-    bytes: *mut u8,
-    bytes_len: usize) {
+    balance: *const u8,
+    code: *const u8,
+    code_len: usize) {
 
     let ctx = unsafe{&mut *ptr};
 
-    if balance_ptr.is_null() {
+    if balance.is_null() {
         ctx.vm.commit_account(AccountCommitment::Full {
-            address: address_from_ptr(addr_ptr),
+            address: address_from_bits(addr),
             balance: U256::zero(),
             code: Rc::new(EMPTY.as_ref().into()),
             nonce: U256::zero(),
         });
     } else {
-        let code = if bytes.is_null() {
-            EMPTY.as_ref().into()
-        } else {
-            unsafe { Vec::from_raw_parts(bytes, bytes_len, bytes_len) }
-        };
         ctx.vm.commit_account(AccountCommitment::Full {
-            address: address_from_ptr(addr_ptr),
-            balance: u256_from_ptr(balance_ptr),
-            code: Rc::new(code),
+            address: address_from_bits(addr),
+            balance: u256_from_bits(balance),
+            code: Rc::new(if code.is_null() {
+                EMPTY.as_ref().into()
+            } else {
+                vec_from_bits(code, code_len)
+            }),
             nonce: nonce.into(),
         });
     }
@@ -217,20 +280,19 @@ pub extern fn sputnikvm_commit_account(
 #[no_mangle]
 pub extern fn sputnikvm_commit_code(
     ptr: *mut EvmContext,
-    addr_ptr: *const c_char,
-    bytes: *mut u8,
-    bytes_len: usize) {
+    addr: *const u8,
+    code: *const u8,
+    code_len: usize) {
 
     let ctx = unsafe{&mut *ptr};
-    let code = if bytes.is_null() {
-        EMPTY.as_ref().into()
-    } else {
-        unsafe { Vec::from_raw_parts(bytes, bytes_len, bytes_len) }
-    };
 
     ctx.vm.commit_account(AccountCommitment::Code {
-        address: address_from_ptr(addr_ptr),
-        code: Rc::new(code),
+        address: address_from_bits(addr),
+        code: Rc::new(if code.is_null() {
+            EMPTY.as_ref().into()
+        } else {
+            vec_from_bits(code, code_len)
+        }),
     });
 }
 
@@ -238,55 +300,61 @@ pub extern fn sputnikvm_commit_code(
 pub extern fn sputnikvm_commit_blockhash(
     ptr: *mut EvmContext,
     number: u64,
-    hash_ptr: *const c_char) {
+    hash: *const u8) {
 
     let ctx = unsafe{&mut *ptr};
-    ctx.vm.commit_blockhash(number.into(), h256_from_ptr(hash_ptr));
+    ctx.vm.commit_blockhash(number.into(), h256_from_bits(hash));
 }
 
 #[no_mangle]
 pub extern fn sputnikvm_commit_value(
     ptr: *mut EvmContext,
-    addr_ptr: *const c_char,
-    key_ptr: *const c_char,
-    value_ptr: *const c_char) {
+    addr: *const u8,
+    key: *const u8,
+    value: *const u8) {
 
     let ctx = unsafe{&mut *ptr};
     ctx.vm.commit_account(AccountCommitment::Storage {
-        address: address_from_ptr(addr_ptr),
-        index: u256_from_ptr(key_ptr),
-        value: m256_from_ptr(value_ptr),
+        address: address_from_bits(addr),
+        index: h256_from_bits(key).into(),
+        value: h256_from_bits(value).into(),
     });
 
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_out(ptr: *mut EvmContext) -> *const c_char {
-    let ctx = unsafe{&mut *ptr};
-    let v = ctx.vm.out().to_vec();
-    ctx.out_len = v.len();
-    ctx.out = unsafe { CString::from_vec_unchecked(v) };
-    ctx.out.as_ptr()
-}
-
-#[no_mangle]
 pub extern fn sputnikvm_out_len(ptr: *mut EvmContext) -> size_t {
     let ctx = unsafe{&mut *ptr};
-    ctx.out_len
+    ctx.vm.out().len()
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_gas(ptr: *mut EvmContext) -> *const c_char {
+pub extern fn sputnikvm_out_copy(ptr: *mut EvmContext, out: *mut u8) -> size_t {
     let ctx = unsafe{&mut *ptr};
-    ctx.out = CString::new(format!("0x{:x}",ctx.vm.available_gas())).unwrap();
-    ctx.out.as_ptr()
+    let v = ctx.vm.out();
+    let len = v.len();
+    unsafe { ptr::copy(&v[0],out, len) };
+    len
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_refund(ptr: *mut EvmContext) -> *const c_char {
+pub extern fn sputnikvm_gas_copy(ptr: *mut EvmContext, bits: *mut u8) -> size_t {
     let ctx = unsafe{&mut *ptr};
-    ctx.out = CString::new(format!("0x{:x}",ctx.vm.refunded_gas())).unwrap();
-    ctx.out.as_ptr()
+    let out = unsafe { slice::from_raw_parts_mut( bits, 32) };
+    let gas = ctx.vm.available_gas();
+    let u256 : U256 = gas.into();
+    u256.to_little_endian(out);
+    32
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_refund_copy(ptr: *mut EvmContext, bits: *mut u8) -> size_t {
+    let ctx = unsafe{&mut *ptr};
+    let out = unsafe { slice::from_raw_parts_mut( bits, 32) };
+    let gas = ctx.vm.refunded_gas();
+    let u256 : U256 = gas.into();
+    u256.to_little_endian(out);
+    32
 }
 
 #[no_mangle]
@@ -312,20 +380,6 @@ pub extern fn sputnikvm_error(ptr: *mut EvmContext) -> *const c_char {
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_first_account(ptr: *mut EvmContext) -> *const AccountChange {
-    let ctx = unsafe{&mut *ptr};
-    ctx.account =
-        Accounts{
-            list: ctx.vm.accounts().into_iter().map(|c|{let x: *const AccountChange = c; x}).collect(),
-            index: 0,
-        };
-    match ctx.account.next() {
-        None => ptr::null(),
-        Some(x) => x
-    }
-}
-
-#[no_mangle]
 pub extern fn sputnikvm_next_account(ptr: *mut EvmContext) -> *const AccountChange {
     let ctx = unsafe{&mut *ptr};
     match ctx.account.next() {
@@ -335,8 +389,18 @@ pub extern fn sputnikvm_next_account(ptr: *mut EvmContext) -> *const AccountChan
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_acc_address(q: *mut EvmContext, ptr: *const AccountChange) -> *const c_char {
-    let ctx = unsafe{&mut *q};
+pub extern fn sputnikvm_first_account(ptr: *mut EvmContext) -> *const AccountChange {
+    let ctx = unsafe{&mut *ptr};
+    ctx.account =
+        Accounts{
+            list: ctx.vm.accounts().into_iter().map(|c|{let x: *const AccountChange = c; x}).collect(),
+            index: 0,
+        };
+    sputnikvm_next_account(ptr)
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_acc_address_copy(ptr: *const AccountChange, out: *mut u8) -> size_t {
     let acc = unsafe{&*ptr};
     let address = match acc {
         &AccountChange::Full {ref address, .. } => address,
@@ -344,22 +408,22 @@ pub extern fn sputnikvm_acc_address(q: *mut EvmContext, ptr: *const AccountChang
         &AccountChange::IncreaseBalance (ref address, _) => address,
         &AccountChange::DecreaseBalance (ref address, _) => address,
     };
-    ctx.out = CString::new(format!("0x{:x}",address)).unwrap();
-    ctx.out.as_ptr()
+    unsafe { ptr::copy(&address[0],out,20) };
+    20
 }
 
 #[no_mangle]
-pub extern fn sputnikvm_acc_balance(q: *mut EvmContext, ptr: *const AccountChange) -> *const c_char {
-    let ctx = unsafe{&mut *q};
+pub extern fn sputnikvm_acc_balance_copy(ptr: *const AccountChange, bits: *mut u8) -> size_t {
     let acc = unsafe{&*ptr};
-    let balance = match acc {
+    let balance : U256 = *match acc {
         &AccountChange::Full {ref balance, .. } => balance,
         &AccountChange::Create {ref balance, ..} => balance,
         &AccountChange::IncreaseBalance (_, ref balance) => balance,
         &AccountChange::DecreaseBalance (_, ref balance) => balance,
     };
-    ctx.out = CString::new(format!("0x{:x}",balance)).unwrap();
-    ctx.out.as_ptr()
+    let out = unsafe { slice::from_raw_parts_mut( bits, 32) };
+    balance.to_little_endian(out);
+    32
 }
 
 const UPDATE_ACCOUNT : i32 = 0;
@@ -409,5 +473,121 @@ pub extern fn sputnikvm_acc_code_len(ptr: *const AccountChange) -> size_t {
         &AccountChange::Full {ref code, ..} => code.len(),
         &AccountChange::Create {ref code, ..} => code.len(),
         _ => 0,
+    }
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_acc_code_copy(ptr: *const AccountChange, out: *mut u8) -> size_t {
+    let acc = unsafe{&*ptr};
+    let bytes = match acc {
+        &AccountChange::Full {ref code, ..} => Rc::clone(code),
+        &AccountChange::Create {ref code, ..} => Rc::clone(code),
+        _ => Rc::new(EMPTY.as_ref().into()),
+    };
+    let len = bytes.len();
+    unsafe { ptr::copy(&bytes[0], out,len) };
+    len
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_acc_next_kv_copy(q: *mut EvmContext, k: *mut u8, v: *mut u8) -> size_t {
+    let ctx = unsafe{&mut *q};
+    match ctx.kv.next() {
+        None => 0,
+        Some(&(x,y)) => {
+            unsafe { ptr::copy(&x[0],k, 32) };
+            unsafe { ptr::copy(&y[0],v, 32) };
+            32*2
+        }
+    }
+}
+
+fn collect_values(m : HashMap<U256,M256> ) -> Vec<(H256,H256)> {
+    m.iter().map(|(k, v)| { (H256::from(k), H256::from(*v)) }).collect()
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_acc_first_kv_copy(q: *mut EvmContext, ptr: *const AccountChange, k: *mut u8, v: *mut u8) -> size_t {
+    let acc = unsafe{&*ptr};
+    let ctx = unsafe{&mut *q};
+    ctx.kv =
+        KV {
+            list: match acc {
+                &AccountChange::Full { ref changing_storage, .. } => collect_values(changing_storage.clone().into()),
+                &AccountChange::Create { ref storage, .. } => collect_values(storage.clone().into()),
+                _ => Vec::new(),
+            },
+            index: 0,
+        };
+    sputnikvm_acc_next_kv_copy(q,k,v)
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_logs_count(ptr: *mut EvmContext) -> size_t {
+    let ctx = unsafe{&mut *ptr};
+    ctx.vm.logs().len()
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_log(ptr: *mut EvmContext, index: size_t) -> *const Log {
+    let ctx = unsafe{&mut *ptr};
+    let logs : &[Log]= ctx.vm.logs();
+    let len = logs.len();
+    if index < len { let x : *const Log = &logs[index]; x } else { ptr::null() }
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_log_address_copy(ptr: *const Log, address: *mut u8) -> size_t {
+    let log : &Log = unsafe{&*ptr};
+    unsafe { ptr::copy(&log.address[0],address,20) };
+    20
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_log_data_len(ptr: *const Log) -> size_t {
+    let log : &Log = unsafe{&*ptr};
+    log.data.len()
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_log_data_copy(ptr: *const Log, data: *mut u8) -> size_t {
+    let log : &Log = unsafe{&*ptr};
+    let len = log.data.len();
+    unsafe { ptr::copy(&log.data[0],data,len) };
+    len
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_log_topics_count(ptr: *const Log) -> size_t {
+    let log : &Log = unsafe{&*ptr};
+    log.topics.len()
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_log_topic_copy(ptr: *const Log, index: size_t, topic: *mut u8) -> size_t {
+    let log : &Log = unsafe{&*ptr};
+    if index < log.topics.len() {
+        unsafe { ptr::copy(&log.topics[index][0], topic, 32) };
+        32
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_suicides_count(ptr: *mut EvmContext) -> size_t {
+    let ctx = unsafe{&mut *ptr};
+    ctx.vm.removed().len()
+}
+
+#[no_mangle]
+pub extern fn sputnikvm_suicide_copy(ptr: *mut EvmContext, index: size_t, address: *mut u8) -> size_t {
+    let ctx = unsafe{&mut *ptr};
+    let suicides : &[Address] = ctx.vm.removed();
+    if index < suicides.len() {
+        unsafe { ptr::copy(&suicides[index][0],address,20) };
+        20
+    } else {
+        0
     }
 }

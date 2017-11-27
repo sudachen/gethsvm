@@ -5,7 +5,7 @@ license = "Apache-2.0"
 authors = ["Alexey Sudachen <alexey@sudachen.name>"]
 description = "Classic Go-Ethereum adapter to SputnikVM"
 repository = "https://github.com/ethereumproject/gethsvm"
-keywords = ["allow(ctypes)"]
+keywords = ["allow(ctypes)", "std"]
 
 [lib]
 crate_type = ["cdylib"]
@@ -18,4 +18,7 @@ etcommon-block = "0.3"
 etcommon-bigint = "0.2"
 etcommon-hexutil = "0.2"
 libc = "0.2"
+arrayref = "0.3.4"
+
+
 
