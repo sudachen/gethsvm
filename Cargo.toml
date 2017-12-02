@@ -1,5 +1,5 @@
 [package]
-name = "gethsvm"
+name = "sputnikvm-libffi"
 version = "0.1.0"
 license = "Apache-2.0"
 authors = ["Alexey Sudachen <alexey@sudachen.name>"]
@@ -8,17 +8,21 @@ repository = "https://github.com/ethereumproject/gethsvm"
 keywords = ["allow(ctypes)", "std"]
 
 [lib]
-crate_type = ["cdylib"]
-name = "sputnikvm"
+crate_type = ["staticlib"]
+name = "svmffi"
 
 [dependencies]
-sputnikvm = "0.8"
-etcommon-block-core = "0.1"
-etcommon-block = "0.3"
-etcommon-bigint = "0.2"
-etcommon-hexutil = "0.2"
+sputnikvm = { path = "deps/sputnikvm", version = "0.9.1" }
+secp256k1-plus = { path = "deps/secp256k1-plus", version = "0.5.7", optional = true }
+etcommon-bigint = { path = "deps/etcommon-bigint", version = "0.2.9", optional = true }
+etcommon-block = { path = "deps/etcommon-block", version = "0.3", optional = true }
+etcommon-block-core = { path = "deps/etcommon-block-core", version = "0.1", optional = true }
 libc = "0.2"
-arrayref = "0.3.4"
+
+[features]
+c-secp256k1 = ["secp256k1-plus", "etcommon-block/c-secp256k1"]
+std = ["etcommon-block-core/std", "etcommon-bigint/std", "etcommon-block"]
+default = ["std", "c-secp256k1"]
 
 
 

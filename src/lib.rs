@@ -1,13 +1,9 @@
 
 extern crate sputnikvm;
-extern crate hexutil;
 extern crate bigint;
 extern crate libc;
 extern crate block_core;
 extern crate block;
-
-#[macro_use]
-extern crate arrayref;
 
 use std::mem::{drop,forget};
 use std::ffi::{CStr,CString};
@@ -15,14 +11,272 @@ use std::rc::Rc;
 use std::ptr;
 use std::slice;
 use std::str::FromStr;
-use std::collections::{HashSet,HashMap,hash_map};
+use std::collections::{HashMap as Map, HashSet as Set, hash_map as map};
+use std::cmp::min;
+use std::ops::Deref;
 
 use libc::{c_char,size_t};
 use bigint::{Gas, H160, U256, H256, M256, Address};
-use hexutil::*;
 use block::TransactionAction;
-use sputnikvm::errors::RequireError;
-use sputnikvm::{Log,VM, SeqTransactionVM, HeaderParams, MainnetFrontierPatch, MainnetHomesteadPatch, MainnetEIP160Patch, ValidTransaction, SeqContextVM, AccountCommitment, Context, AccountChange, Storage, Patch, VMStatus};
+use sputnikvm::errors::{RequireError,CommitError};
+use sputnikvm::{ValidTransaction, Storage,
+                State, Machine, Context, ContextVM, VM, AccountState,
+                BlockhashState, Patch, HeaderParams, Memory, SeqMemory, VMStatus,
+                AccountCommitment, Log, AccountChange, MachineStatus};
+use sputnikvm::{MainnetFrontierPatch, MainnetHomesteadPatch, MainnetEIP160Patch};
+
+enum VM1State<M, P: Patch> {
+    Running {
+        vm: ContextVM<M, P>,
+        intrinsic_gas: Gas,
+        preclaimed_value: U256,
+        finalized: bool,
+        code_deposit: bool,
+        fresh_account_state: AccountState<P::Account>,
+    },
+    Constructing {
+        transaction: ValidTransaction,
+        block: HeaderParams,
+        account_state: AccountState<P::Account>,
+        blockhash_state: BlockhashState,
+    },
+}
+
+pub struct VM1<M, P: Patch>(VM1State<M, P>);
+
+impl<M: Memory + Default, P: Patch> VM1<M, P> {
+    /// Create a new VM using the given transaction, block header and
+    /// patch. This VM runs at the transaction level.
+    pub fn new(transaction: ValidTransaction, block: HeaderParams) -> Self {
+        VM1(VM1State::Constructing {
+            transaction: transaction,
+            block: block,
+            account_state: AccountState::default(),
+            blockhash_state: BlockhashState::default(),
+        })
+    }
+}
+
+/// Finalize a transaction. This should not be used when invoked
+/// by an opcode.
+fn finalize_transaction<M: Memory + Default, P: Patch>(
+    vm: &mut ContextVM<M,P>,
+    real_used_gas: Gas,
+    preclaimed_value: U256,
+    fresh_account_state: &AccountState<P::Account>) -> Result<(), RequireError> {
+
+    let status = vm.machines[0].status.clone();
+    let st = &mut vm.machines[0].state;
+
+    st.account_state.require(st.context.address)?;
+
+    match status {
+        MachineStatus::ExitedOk => {
+            // Requires removed accounts to exist.
+            for address in &st.removed {
+                st.account_state.require(*address)?;
+            }
+        },
+        MachineStatus::ExitedErr(_) => {
+            // If exited with error, reset all changes.
+            st.account_state = fresh_account_state.clone();
+            // on error all gas is consumed
+            // m.state.account_state.increase_balance(m.state.context.caller, preclaimed_value);
+            st.logs = Vec::new();
+            st.removed = Vec::new();
+        },
+        _ => panic!(),
+    }
+
+    let gas_dec = (st.memory_gas() + st.used_gas) * st.context.gas_price;
+    st.account_state.increase_balance(st.context.caller, preclaimed_value);
+    st.account_state.decrease_balance(st.context.caller, gas_dec.into());
+
+    for address in &st.removed {
+        st.account_state.remove(*address).unwrap();
+    }
+
+    match status {
+        MachineStatus::ExitedOk => Ok(()),
+        MachineStatus::ExitedErr(_) => Ok(()),
+        _ => panic!(),
+    }
+}
+
+impl<M: Memory + Default, P: Patch> VM for VM1<M, P> {
+    fn commit_account(&mut self, commitment: AccountCommitment) -> Result<(), CommitError> {
+        match self.0 {
+            VM1State::Running { ref mut vm, .. } => vm.commit_account(commitment),
+            VM1State::Constructing { ref mut account_state, .. } => account_state.commit(commitment),
+        }
+    }
+
+    fn commit_blockhash(&mut self, number: U256, hash: H256) -> Result<(), CommitError> {
+        match self.0 {
+            VM1State::Running { ref mut vm, .. } => vm.commit_blockhash(number, hash),
+            VM1State::Constructing { ref mut blockhash_state, .. } => blockhash_state.commit(number, hash),
+        }
+    }
+
+    fn status(&self) -> VMStatus {
+        match self.0 {
+            VM1State::Running { ref vm, finalized, .. } => {
+                if !finalized {
+                    VMStatus::Running
+                } else {
+                    vm.status()
+                }
+            },
+            VM1State::Constructing { .. } => VMStatus::Running,
+        }
+    }
+
+    fn step(&mut self) -> Result<(), RequireError> {
+        let real_used_gas = self.used_gas();
+
+        self.0 = match self.0 {
+            VM1State::Constructing {
+                ref transaction, ref block,
+                ref mut account_state, ref blockhash_state
+            } => {
+                let address = transaction.address();
+                account_state.require(address)?;
+
+                let ccode_deposit = match transaction.action {
+                    TransactionAction::Call(_) => false,
+                    TransactionAction::Create => true,
+                };
+
+                let cpreclaimed_value = transaction.preclaimed_value();
+                let ccontext = transaction.clone().into_context::<P>(Gas::from(0u64), None, account_state, false)?;
+                let cblock = block.clone();
+                let caccount_state = account_state.clone();
+                let cblockhash_state = blockhash_state.clone();
+                let account_state = caccount_state;
+                let mut vm = ContextVM::with_states(ccontext, cblock,
+                                                    account_state.clone(),
+                                                    cblockhash_state);
+
+                if ccode_deposit {
+                    vm.machines[0].initialize_create(cpreclaimed_value).unwrap();
+                } else {
+                    vm.machines[0].initialize_call(cpreclaimed_value);
+                }
+
+                VM1State::Running {
+                    fresh_account_state: account_state,
+                    vm,
+                    intrinsic_gas: Gas::from(0u64),
+                    finalized: false,
+                    code_deposit: ccode_deposit,
+                    preclaimed_value: cpreclaimed_value,
+                }
+            },
+            VM1State::Running {
+                ref mut vm,
+                ref mut finalized,
+                ref mut code_deposit,
+                ref fresh_account_state,
+                preclaimed_value,
+                ..
+            } => return match vm.status() {
+                VMStatus::Running => {
+                    vm.step()
+                },
+                VMStatus::ExitedNotSupported(_) => {
+                    Ok(())
+                },
+                _ => {
+                    if *code_deposit {
+                        vm.machines[0].code_deposit();
+                        *code_deposit = false;
+                        return Ok(());
+                    } else if !*finalized {
+                        vm.machines[0].finalize(vm.runtime.block.beneficiary,
+                                                real_used_gas, preclaimed_value,
+                                                fresh_account_state)?;
+                        //finalize_transaction(vm,real_used_gas,preclaimed_value,fresh_account_state)?;
+                        *finalized = true;
+                        Ok(())
+                    } else {
+                        vm.step()
+                    }
+                }
+            }
+        };
+        Ok(())
+    }
+
+    fn accounts(&self) -> map::Values<Address, AccountChange> {
+        match self.0 {
+            VM1State::Running { ref vm, .. } => vm.accounts(),
+            VM1State::Constructing { ref account_state, .. } => account_state.accounts(),
+        }
+    }
+
+    fn used_addresses(&self) -> Set<Address> {
+        match self.0 {
+            VM1State::Running { ref vm, .. } => vm.used_addresses(),
+            VM1State::Constructing { ref account_state, .. } => account_state.used_addresses(),
+        }
+    }
+
+    fn out(&self) -> &[u8] {
+        match self.0 {
+            VM1State::Running { ref vm, .. } => vm.out(),
+            VM1State::Constructing { .. } => &[],
+        }
+    }
+
+    fn available_gas(&self) -> Gas {
+        match self.0 {
+            VM1State::Running { ref vm, .. } => vm.available_gas(),
+            VM1State::Constructing { ref transaction, .. } => transaction.gas_limit,
+        }
+    }
+
+    fn refunded_gas(&self) -> Gas {
+        match self.0 {
+            VM1State::Running { ref vm, .. } => vm.refunded_gas(),
+            VM1State::Constructing { .. } => Gas::zero(),
+        }
+    }
+
+    fn logs(&self) -> &[Log] {
+        match self.0 {
+            VM1State::Running { ref vm, .. } => vm.logs(),
+            VM1State::Constructing { .. } => &[],
+        }
+    }
+
+    fn removed(&self) -> &[Address] {
+        match self.0 {
+            VM1State::Running { ref vm, .. } => vm.removed(),
+            VM1State::Constructing { .. } => &[],
+        }
+    }
+
+    fn used_gas(&self) -> Gas {
+        match self.0 {
+            VM1State::Running { ref vm, intrinsic_gas, .. } => {
+                match vm.machines[0].status() {
+                    MachineStatus::ExitedErr(_) =>
+                        vm.machines[0].state().context.gas_limit + intrinsic_gas,
+                    MachineStatus::ExitedOk => {
+                        let total_used = vm.machines[0].state().memory_gas() + vm.machines[0].state().used_gas + intrinsic_gas;
+                        let refund_cap = total_used / Gas::from(2u64);
+                        let refunded = min(refund_cap, vm.machines[0].state().refunded_gas);
+                        total_used - refunded
+                    }
+                    _ => Gas::zero(),
+                }
+            }
+            VM1State::Constructing { .. } => Gas::zero(),
+        }
+    }
+}
+
+pub type SeqVM1<P> = VM1<SeqMemory<P>, P>;
 
 #[no_mangle]
 pub extern fn sputnikvm_is_implemented() -> i32 {
@@ -117,7 +371,6 @@ const SPUTNIK_VM_FORK_FRONTIER : i32 = 0;
 const SPUTNIK_VM_FORK_HOMESTEAD : i32 = 1;
 const SPUTNIK_VM_FORK_GASREPRICE : i32 = 2;
 const SPUTNIK_VM_FORK_DIEHARD : i32 = 3;
-
 const G_TXDATAZERO: u64 = 4;
 const G_TXDATANONZERO: u64 = 68;
 const G_TRANSACTION: u64 = 21000;
@@ -141,10 +394,10 @@ pub extern fn sputnikvm_context(
 
     fn new_vm( t: ValidTransaction, p: HeaderParams, fork: i32 ) -> Box<VM> {
         match fork {
-            SPUTNIK_VM_FORK_FRONTIER => Box::new(SeqTransactionVM::<MainnetFrontierPatch>::new(t, p)),
-            SPUTNIK_VM_FORK_HOMESTEAD => Box::new(SeqTransactionVM::<MainnetHomesteadPatch>::new(t, p)),
-            SPUTNIK_VM_FORK_DIEHARD => Box::new(SeqTransactionVM::<MainnetEIP160Patch>::new(t, p)),
-            _ => Box::new(SeqTransactionVM::<MainnetEIP160Patch>::new(t, p)),
+            SPUTNIK_VM_FORK_FRONTIER => Box::new(SeqVM1::<MainnetFrontierPatch>::new(t, p)),
+            SPUTNIK_VM_FORK_HOMESTEAD => Box::new(SeqVM1::<MainnetHomesteadPatch>::new(t, p)),
+            SPUTNIK_VM_FORK_DIEHARD => Box::new(SeqVM1::<MainnetEIP160Patch>::new(t, p)),
+            _ => Box::new(SeqVM1::<MainnetEIP160Patch>::new(t, p)),
         }
     };
 
@@ -192,7 +445,6 @@ const SPUTNIK_VM_EXITED_OK : i32 = 0;
 const SPUTNIK_VM_EXITED_ERR : i32 = 1;
 const SPUTNIK_VM_RUNNING : i32 = 2;
 const SPUTNIK_VM_UNSUPPORTED_ERR : i32 = 3;
-
 const SPUTNIK_VM_REQUIRE_ACCOUNT : i32 = 2;
 const SPUTNIK_VM_REQUIRE_CODE : i32 = 3;
 const SPUTNIK_VM_REQUIRE_HASH : i32 = 4;
@@ -319,7 +571,6 @@ pub extern fn sputnikvm_commit_value(
         index: h256_from_bits(key).into(),
         value: h256_from_bits(value).into(),
     });
-
 }
 
 #[no_mangle]
@@ -502,7 +753,7 @@ pub extern fn sputnikvm_acc_next_kv_copy(q: *mut EvmContext, k: *mut u8, v: *mut
     }
 }
 
-fn collect_values(m : HashMap<U256,M256> ) -> Vec<(H256,H256)> {
+fn collect_values(m : Map<U256,M256> ) -> Vec<(H256,H256)> {
     m.iter().map(|(k, v)| { (H256::from(k), H256::from(*v)) }).collect()
 }
 
