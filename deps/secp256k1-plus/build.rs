@@ -54,7 +54,7 @@ fn concat_paths(first: &str, second: &str) -> PathBuf {
 	path
 }
 
-fn setup_android(config: &mut gcc::Config) {
+fn setup_android(config: &mut gcc::Build) {
 	let path = env::var_os("PATH").unwrap_or_else(OsString::new);
 	let ndk_home = env::var("NDK_HOME").expect("NDK_HOME is not set");
 	let mut paths = env::split_paths(&path).collect::<Vec<_>>();
@@ -69,7 +69,7 @@ fn setup_android(config: &mut gcc::Config) {
 }
 
 fn main() {
-	let mut base_config = gcc::Config::new();
+	let mut base_config = gcc::Build::new();
 	base_config.include("depend/secp256k1/")
 		.include("depend/secp256k1/include")
 		.include("depend/secp256k1/src");
@@ -79,7 +79,7 @@ fn main() {
 		setup_android(&mut base_config);
 	}
 
-	base_config.flag("-g")
+	base_config.flag("-g").flag("-Wno-unused-function")
 		// TODO these three should be changed to use libgmp, at least until secp PR 290 is merged
 		.define("USE_NUM_NONE", Some("1"))
 		.define("USE_FIELD_INV_BUILTIN", Some("1"))
@@ -95,7 +95,7 @@ fn main() {
 
 	// secp256k1
 	base_config.file("depend/secp256k1/contrib/lax_der_parsing.c")
-		.file("depend/secp256k1/src/ext.c")
+		.file("depend/ext.c")
 		.compile("libsecp256k1.a");
 }
 

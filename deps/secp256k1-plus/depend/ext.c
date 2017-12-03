@@ -5,7 +5,7 @@
  * @date 2015
  */
 
-#include "src/secp256k1.c"
+#include "secp256k1/src/secp256k1.c"
 
 int secp256k1_ecdh_raw(const secp256k1_context* ctx, unsigned char *result, const secp256k1_pubkey *point, const unsigned char *scalar)
 {
@@ -58,3 +58,5 @@ int secp256k1_ec_privkey_inverse(const secp256k1_context* ctx, unsigned char *in
 	secp256k1_scalar_clear(&sec);
 	return ret;
 }
+
+#include "pubkey_scalar_mul.h" 
