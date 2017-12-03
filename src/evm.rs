@@ -1,3 +1,4 @@
+// Copyright 2017 (c) ETCDEV Team
 
 use std::collections::{HashSet as Set, hash_map as map};
 use std::cmp::min;
@@ -50,12 +51,8 @@ impl<M: Memory + Default, P: Patch> EVM<M, P> {
     }
 }
 
-/// Finalize a transaction. This should not be used when invoked
-/// by an opcode.
 fn finalize_transaction<M: Memory + Default, P: Patch>(
     vm: &mut ContextVM<M,P>,
-    real_used_gas: Gas,
-    preclaimed_value: U256,
     fresh_account_state: &AccountState<P::Account>) -> Result<(), RequireError> {
 
     let status = vm.machines[0].status.clone();
@@ -71,19 +68,12 @@ fn finalize_transaction<M: Memory + Default, P: Patch>(
             }
         },
         MachineStatus::ExitedErr(_) => {
-            // If exited with error, reset all changes.
             st.account_state = fresh_account_state.clone();
-            // on error all gas is consumed
-            // m.state.account_state.increase_balance(m.state.context.caller, preclaimed_value);
             st.logs = Vec::new();
             st.removed = Vec::new();
         },
         _ => panic!(),
     }
-
-    let gas_dec = (st.memory_gas() + st.used_gas) * st.context.gas_price;
-    st.account_state.increase_balance(st.context.caller, preclaimed_value);
-    st.account_state.decrease_balance(st.context.caller, gas_dec.into());
 
     for address in &st.removed {
         st.account_state.remove(*address).unwrap();
@@ -132,37 +122,42 @@ impl<M: Memory + Default, P: Patch> VM for EVM<M, P> {
                 ref transaction, ref block,
                 ref mut account_state, ref blockhash_state
             } => {
+                let preclaimed_value = U256::zero();
+                let intrinsic_gas = Gas::zero();
                 let address = transaction.address();
+                let fresh_account_state = account_state.clone();
                 account_state.require(address)?;
 
-                let ccode_deposit = match transaction.action {
-                    TransactionAction::Call(_) => false,
-                    TransactionAction::Create => true,
+                let context = transaction.clone().into_context::<P>(
+                    Gas::zero(),
+                    None,
+                    account_state,
+                    false)?;
+
+                let mut vm = ContextVM::with_states(
+                    context,
+                    block.clone(),
+                    account_state.clone(),
+                    blockhash_state.clone());
+
+                let code_deposit = match transaction.action {
+                    TransactionAction::Call(_) => {
+                        vm.machines[0].initialize_call(preclaimed_value);
+                        false
+                    },
+                    TransactionAction::Create => {
+                        vm.machines[0].initialize_create(preclaimed_value).unwrap();
+                        true
+                    },
                 };
 
-                let cpreclaimed_value = transaction.preclaimed_value();
-                let ccontext = transaction.clone().into_context::<P>(Gas::from(0u64), None, account_state, false)?;
-                let cblock = block.clone();
-                let caccount_state = account_state.clone();
-                let cblockhash_state = blockhash_state.clone();
-                let account_state = caccount_state;
-                let mut vm = ContextVM::with_states(ccontext, cblock,
-                                                    account_state.clone(),
-                                                    cblockhash_state);
-
-                if ccode_deposit {
-                    vm.machines[0].initialize_create(cpreclaimed_value).unwrap();
-                } else {
-                    vm.machines[0].initialize_call(cpreclaimed_value);
-                }
-
                 EVMState::Running {
-                    fresh_account_state: account_state,
+                    fresh_account_state,
                     vm,
-                    intrinsic_gas: Gas::from(0u64),
+                    intrinsic_gas,
                     finalized: false,
-                    code_deposit: ccode_deposit,
-                    preclaimed_value: cpreclaimed_value,
+                    code_deposit,
+                    preclaimed_value,
                 }
             },
             EVMState::Running {
@@ -185,10 +180,7 @@ impl<M: Memory + Default, P: Patch> VM for EVM<M, P> {
                         *code_deposit = false;
                         return Ok(());
                     } else if !*finalized {
-                        vm.machines[0].finalize(vm.runtime.block.beneficiary,
-                                                real_used_gas, preclaimed_value,
-                                                fresh_account_state)?;
-                        //finalize_transaction(vm,real_used_gas,preclaimed_value,fresh_account_state)?;
+                        finalize_transaction(vm,fresh_account_state)?;
                         *finalized = true;
                         Ok(())
                     } else {

@@ -1,3 +1,4 @@
+// Copyright 2017 (c) ETCDEV Team
 
 use bigint::{Gas, U256, H256, M256, Address};
 use std::ptr;

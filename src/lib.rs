@@ -1,3 +1,4 @@
+// Copyright 2017 (c) ETCDEV Team
 
 extern crate sputnikvm;
 extern crate bigint;
@@ -119,7 +120,7 @@ pub extern fn sputnikvm_context(
             SPUTNIK_VM_FORK_HOMESTEAD => evm::Fork::Homestead,
             SPUTNIK_VM_FORK_GASREPRICE => evm::Fork::EIP150,
             SPUTNIK_VM_FORK_DIEHARD => evm::Fork::EIP160,
-            _ => panic!() // TODO gracefull way to handle this error
+            _ => panic!() // TODO graceful way to handle this error
         });
 
     let mut ctx = Box::new(EvmContext {
