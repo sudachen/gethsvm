@@ -9,7 +9,7 @@ keywords = ["allow(ctypes)", "std"]
 
 [lib]
 crate_type = ["staticlib"]
-name = "svmffi"
+name = "sputnikvm"
 
 [dependencies]
 sputnikvm = { path = "deps/sputnikvm", version = "0.9.1" }
